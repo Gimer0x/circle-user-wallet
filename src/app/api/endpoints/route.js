@@ -146,6 +146,99 @@ export async function POST(request) {
         return NextResponse.json(data.data, { status: 200 });
       }
 
+      case "createContractExecutionChallenge": {
+        const {
+          userToken,
+          walletId,
+          contractAddress,
+          abiFunctionSignature,
+          abiParameters,
+          callData,
+          amount,
+          feeLevel,
+          gasLimit,
+          gasPrice,
+          maxFee,
+          priorityFee,
+          refId,
+        } = params;
+
+        if (!userToken || !walletId || !contractAddress) {
+          return NextResponse.json(
+            { error: "Missing userToken, walletId, or contractAddress" },
+            { status: 400 },
+          );
+        }
+
+        const hasAbi = abiFunctionSignature != null && abiParameters != null;
+        const hasCallData = callData != null && callData !== "";
+
+        if (hasAbi && hasCallData) {
+          return NextResponse.json(
+            {
+              error:
+                "Provide either abiFunctionSignature + abiParameters OR callData, not both",
+            },
+            { status: 400 },
+          );
+        }
+
+        if (!hasAbi && !hasCallData) {
+          return NextResponse.json(
+            {
+              error:
+                "Provide either abiFunctionSignature + abiParameters OR callData",
+            },
+            { status: 400 },
+          );
+        }
+
+        const body = {
+          idempotencyKey: crypto.randomUUID(),
+          contractAddress,
+          walletId,
+        };
+
+        if (hasAbi) {
+          body.abiFunctionSignature = abiFunctionSignature;
+          body.abiParameters = Array.isArray(abiParameters)
+            ? abiParameters
+            : [abiParameters];
+        } else {
+          body.callData = callData;
+        }
+
+        if (amount != null && amount !== "") body.amount = String(amount);
+        if (feeLevel != null && feeLevel !== "") body.feeLevel = feeLevel; // LOW | MEDIUM | HIGH
+        if (gasLimit != null && gasLimit !== "") body.gasLimit = String(gasLimit);
+        if (gasPrice != null && gasPrice !== "") body.gasPrice = String(gasPrice);
+        if (maxFee != null && maxFee !== "") body.maxFee = String(maxFee);
+        if (priorityFee != null && priorityFee !== "") body.priorityFee = String(priorityFee);
+        if (refId != null && refId !== "") body.refId = refId;
+
+        const response = await fetch(
+          `${CIRCLE_BASE_URL}/v1/w3s/user/transactions/contractExecution`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${CIRCLE_API_KEY}`,
+              "X-User-Token": userToken,
+            },
+            body: JSON.stringify(body),
+          },
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          return NextResponse.json(data, { status: response.status });
+        }
+
+        // Returns: { challengeId }
+        return NextResponse.json(data.data, { status: 200 });
+      }
+
       default:
         return NextResponse.json(
           { error: `Unknown action: ${action}` },

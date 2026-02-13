@@ -2,14 +2,17 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { setCookie, getCookie } from "cookies-next";
+import { setCookie, getCookie, deleteCookie } from "cookies-next";
 import { SocialLoginProvider } from "@circle-fin/w3s-pw-web-sdk/dist/src/types";
 
 const appId = process.env.NEXT_PUBLIC_CIRCLE_APP_ID;
 const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+const contractAddress = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || "";
 
 export default function HomePage() {
   const sdkRef = useRef(null);
+  const postLoginFlowRef = useRef(null);
+  const refreshDeviceTokenRef = useRef(null);
 
   const [sdkReady, setSdkReady] = useState(false);
   const [deviceId, setDeviceId] = useState("");
@@ -21,10 +24,14 @@ export default function HomePage() {
   const [loginResult, setLoginResult] = useState(null);
   const [loginError, setLoginError] = useState(null);
 
-  const [challengeId, setChallengeId] = useState(null);
   const [wallets, setWallets] = useState([]);
   const [usdcBalance, setUsdcBalance] = useState(null);
   const [status, setStatus] = useState("Ready");
+
+  // Mint contract execution
+  const [mintReceiver, setMintReceiver] = useState("");
+  const [mintAmount, setMintAmount] = useState("");
+  const [mintLoading, setMintLoading] = useState(false);
 
   // Initialize SDK on mount, using cookies to restore config after redirect
   useEffect(() => {
@@ -39,8 +46,28 @@ export default function HomePage() {
 
           if (error) {
             const err = error;
+            const msg = err?.message || "Login failed";
+            const code = err?.code;
             console.log("Login failed:", err);
-            setLoginError(err.message || "Login failed");
+
+            const isDeviceTokenInvalid =
+              typeof msg === "string" &&
+              msg.toLowerCase().includes("device token") &&
+              msg.toLowerCase().includes("invalid");
+            const isInvalidCredentials = code === 155140;
+
+            if (isDeviceTokenInvalid || isInvalidCredentials) {
+              setLoginError(null);
+              setStatus(
+                isInvalidCredentials
+                  ? "Invalid credentials. Refreshing session..."
+                  : "Device token invalid. Refreshing...",
+              );
+              refreshDeviceTokenRef.current?.();
+              return;
+            }
+
+            setLoginError(msg);
             setLoginResult(null);
             setStatus("Login failed");
             return;
@@ -51,7 +78,8 @@ export default function HomePage() {
             encryptionKey: result.encryptionKey,
           });
           setLoginError(null);
-          setStatus("Login successful. Credentials received from Google.");
+          setStatus("Setting up your wallet...");
+          postLoginFlowRef.current?.(result.userToken, result.encryptionKey);
         };
 
         const restoredAppId = getCookie("appId") || appId || "";
@@ -80,7 +108,7 @@ export default function HomePage() {
 
         if (!cancelled) {
           setSdkReady(true);
-          setStatus("SDK initialized. Ready to create device token.");
+          setStatus("Initializing...");
         }
       } catch (err) {
         console.log("Failed to initialize Web SDK:", err);
@@ -97,9 +125,9 @@ export default function HomePage() {
     };
   }, []);
 
-  // Get / cache deviceId
+  // Get deviceId and ensure device token exists (auto-create or restore from cookies)
   useEffect(() => {
-    const fetchDeviceId = async () => {
+    const ensureDeviceToken = async () => {
       if (!sdkRef.current) return;
 
       try {
@@ -108,28 +136,56 @@ export default function HomePage() {
             ? window.localStorage.getItem("deviceId")
             : null;
 
-        if (cached) {
-          setDeviceId(cached);
+        let id = cached;
+        if (!id) {
+          setDeviceIdLoading(true);
+          id = await sdkRef.current.getDeviceId();
+          setDeviceId(id);
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem("deviceId", id);
+          }
+          setDeviceIdLoading(false);
+        } else {
+          setDeviceId(id);
+        }
+
+        const existingToken = getCookie("deviceToken");
+        const existingKey = getCookie("deviceEncryptionKey");
+        if (existingToken && existingKey) {
+          setDeviceToken(existingToken);
+          setDeviceEncryptionKey(existingKey);
+          setStatus("Ready. Sign in with Google to continue.");
           return;
         }
 
-        setDeviceIdLoading(true);
-        const id = await sdkRef.current.getDeviceId();
-        setDeviceId(id);
+        setStatus("Creating device token...");
+        const response = await fetch("/api/endpoints", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "createDeviceToken", deviceId: id }),
+        });
+        const data = await response.json();
 
-        if (typeof window !== "undefined") {
-          window.localStorage.setItem("deviceId", id);
+        if (!response.ok) {
+          console.log("Create device token failed:", data);
+          setStatus("Failed to create device token");
+          return;
         }
+
+        setDeviceToken(data.deviceToken);
+        setDeviceEncryptionKey(data.deviceEncryptionKey);
+        setCookie("deviceToken", data.deviceToken);
+        setCookie("deviceEncryptionKey", data.deviceEncryptionKey);
+        setStatus("Ready. Sign in with Google to continue.");
       } catch (error) {
-        console.log("Failed to get deviceId:", error);
-        setStatus("Failed to get deviceId");
-      } finally {
+        console.log("Device token setup failed:", error);
+        setStatus("Failed to set up device token");
         setDeviceIdLoading(false);
       }
     };
 
     if (sdkReady) {
-      void fetchDeviceId();
+      void ensureDeviceToken();
     }
   }, [sdkReady]);
 
@@ -223,43 +279,127 @@ export default function HomePage() {
     }
   };
 
-  const handleCreateDeviceToken = async () => {
-    if (!deviceId) {
-      setStatus("Missing deviceId");
-      return;
-    }
-
+  const postLoginFlow = async (userToken, encryptionKey) => {
     try {
-      setStatus("Creating device token...");
+      setStatus("Initializing user...");
       const response = await fetch("/api/endpoints", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "createDeviceToken",
-          deviceId,
+          action: "initializeUser",
+          userToken,
         }),
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        console.log("Create device token failed:", data);
-        setStatus("Failed to create device token");
+        if (data.code === 155106) {
+          await loadWallets(userToken, { source: "alreadyInitialized" });
+          return;
+        }
+        const errorMsg = data.code
+          ? `[${data.code}] ${data.error || data.message}`
+          : data.error || data.message;
+        setStatus("Failed to initialize user: " + errorMsg);
+        return;
+      }
+
+      const challengeIdFromApi = data.challengeId;
+      if (!challengeIdFromApi) {
+        setStatus("No challengeId returned");
+        return;
+      }
+
+      setStatus("Creating wallet...");
+      const sdk = sdkRef.current;
+      if (!sdk) {
+        setStatus("SDK not ready");
+        return;
+      }
+
+      sdk.setAuthentication({ userToken, encryptionKey });
+      sdk.execute(challengeIdFromApi, (error) => {
+        if (error) {
+          console.log("Execute challenge failed:", error);
+          setStatus(
+            "Failed to create wallet: " + (error?.message ?? "Unknown error"),
+          );
+          return;
+        }
+        setStatus("Loading wallet details...");
+        (async () => {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          await loadWallets(userToken, { source: "afterCreate" });
+        })().catch((e) => {
+          console.log("Post-execute follow-up failed:", e);
+          setStatus("Wallet created, but failed to load wallet details.");
+        });
+      });
+    } catch (err) {
+      console.log("Post-login flow error:", err);
+      setStatus("Failed: " + (err?.message ?? "Unknown error"));
+    }
+  };
+  postLoginFlowRef.current = postLoginFlow;
+
+  const refreshDeviceToken = async () => {
+    const id =
+      typeof window !== "undefined"
+        ? window.localStorage.getItem("deviceId")
+        : null;
+    if (!id) {
+      setStatus("Cannot refresh: no deviceId. Please reload the page.");
+      return;
+    }
+    deleteCookie("deviceToken");
+    deleteCookie("deviceEncryptionKey");
+    setDeviceToken("");
+    setDeviceEncryptionKey("");
+
+    try {
+      setStatus("Requesting new device token...");
+      const response = await fetch("/api/endpoints", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "createDeviceToken", deviceId: id }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        setStatus("Failed to refresh device token. Please reload the page.");
         return;
       }
 
       setDeviceToken(data.deviceToken);
       setDeviceEncryptionKey(data.deviceEncryptionKey);
-
       setCookie("deviceToken", data.deviceToken);
       setCookie("deviceEncryptionKey", data.deviceEncryptionKey);
 
-      setStatus("Device token created");
+      const sdk = sdkRef.current;
+      if (sdk) {
+        sdk.updateConfigs({
+          appSettings: { appId },
+          loginConfigs: {
+            deviceToken: data.deviceToken,
+            deviceEncryptionKey: data.deviceEncryptionKey,
+            google: {
+              clientId: googleClientId,
+              redirectUri:
+                typeof window !== "undefined" ? window.location.origin : "",
+              selectAccountPrompt: true,
+            },
+          },
+        });
+      }
+
+      setStatus("Device token refreshed. Please try again.");
     } catch (err) {
-      console.log("Error creating device token:", err);
-      setStatus("Failed to create device token");
+      console.log("Refresh device token failed:", err);
+      setStatus("Failed to refresh device token. Please reload the page.");
     }
   };
+  refreshDeviceTokenRef.current = refreshDeviceToken;
 
   const handleLoginWithGoogle = () => {
     const sdk = sdkRef.current;
@@ -298,115 +438,98 @@ export default function HomePage() {
     sdk.performLogin(SocialLoginProvider.GOOGLE);
   };
 
-  const handleInitializeUser = async () => {
-    if (!loginResult?.userToken) {
-      setStatus("Missing userToken. Please login with Google first.");
+  const handleMint = async () => {
+    const sdk = sdkRef.current;
+    const wallet = wallets[0];
+
+    if (!sdk) {
+      setStatus("SDK not ready");
+      return;
+    }
+    if (!loginResult?.userToken || !loginResult?.encryptionKey) {
+      setStatus("Missing login credentials. Please login again.");
+      return;
+    }
+    if (!wallet?.id) {
+      setStatus("No wallet available. Create a wallet first.");
+      return;
+    }
+    if (!contractAddress?.trim()) {
+      setStatus("NEXT_PUBLIC_CONTRACT_ADDRESS is not set in .env.local.");
+      return;
+    }
+    if (!mintReceiver?.trim()) {
+      setStatus("Enter the receiver address.");
+      return;
+    }
+    const amount = mintAmount?.trim();
+    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+      setStatus("Enter a valid mint amount (positive number).");
       return;
     }
 
-    try {
-      setStatus("Initializing user...");
+    setMintLoading(true);
+    setStatus("Creating mint challenge...");
 
+    try {
       const response = await fetch("/api/endpoints", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "initializeUser",
+          action: "createContractExecutionChallenge",
           userToken: loginResult.userToken,
+          walletId: wallet.id,
+          contractAddress: contractAddress.trim(),
+          abiFunctionSignature: "mint(uint256,address)",
+          abiParameters: [amount, mintReceiver.trim()],
+          feeLevel: "MEDIUM",
         }),
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        // 155106 = user already initialized
-        if (data.code === 155106) {
-          // User already initialized; load wallet details instead of trying to create again
-          await loadWallets(loginResult.userToken, {
-            source: "alreadyInitialized",
-          });
-          // No challenge to execute when wallet already exists
-          setChallengeId(null);
+        console.log("Create mint challenge failed:", data);
+        setStatus(
+          "Failed to create mint challenge: " +
+            (data.error || data.message || JSON.stringify(data)),
+        );
+        setMintLoading(false);
+        return;
+      }
+
+      const mintChallengeId = data.challengeId;
+      if (!mintChallengeId) {
+        setStatus("No challengeId returned from API");
+        setMintLoading(false);
+        return;
+      }
+
+      sdk.setAuthentication({
+        userToken: loginResult.userToken,
+        encryptionKey: loginResult.encryptionKey,
+      });
+
+      setStatus("Approve the mint in the SDK...");
+
+      sdk.execute(mintChallengeId, (error) => {
+        setMintLoading(false);
+
+        if (error) {
+          console.log("Mint execute failed:", error);
+          setStatus(
+            "Mint failed: " + (error?.message ?? "User denied or transaction failed"),
+          );
           return;
         }
 
-        const errorMsg = data.code
-          ? `[${data.code}] ${data.error || data.message}`
-          : data.error || data.message;
-        setStatus("Failed to initialize user: " + errorMsg);
-        return;
-      }
-
-      // Successful initialization → get challengeId
-      setChallengeId(data.challengeId);
-      setStatus(`User initialized. challengeId: ${data.challengeId}`);
-    } catch (err) {
-      const error = err;
-
-      if (error?.code === 155106 && loginResult?.userToken) {
-        await loadWallets(loginResult.userToken, {
-          source: "alreadyInitialized",
-        });
-        setChallengeId(null);
-        return;
-      }
-
-      const errorMsg = error?.code
-        ? `[${error.code}] ${error.message}`
-        : error?.message || "Unknown error";
-      setStatus("Failed to initialize user: " + errorMsg);
-    }
-  };
-
-  const handleExecuteChallenge = () => {
-    const sdk = sdkRef.current;
-    if (!sdk) {
-      setStatus("SDK not ready");
-      return;
-    }
-
-    if (!challengeId) {
-      setStatus("Missing challengeId. Initialize user first.");
-      return;
-    }
-
-    if (!loginResult?.userToken || !loginResult?.encryptionKey) {
-      setStatus("Missing login credentials. Please login again.");
-      return;
-    }
-
-    sdk.setAuthentication({
-      userToken: loginResult.userToken,
-      encryptionKey: loginResult.encryptionKey,
-    });
-
-    setStatus("Executing challenge...");
-
-    sdk.execute(challengeId, (error) => {
-      const err = error || {};
-
-      if (error) {
-        console.log("Execute challenge failed:", err);
-        setStatus(
-          "Failed to execute challenge: " + (err?.message ?? "Unknown error"),
-        );
-        return;
-      }
-
-      setStatus("Challenge executed. Loading wallet details...");
-
-      void (async () => {
-        // small delay to give Circle time to index the wallet
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-
-        // Challenge consumed; clear it and load wallet details (and balance)
-        setChallengeId(null);
-        await loadWallets(loginResult.userToken, { source: "afterCreate" });
-      })().catch((e) => {
-        console.log("Post-execute follow-up failed:", e);
-        setStatus("Wallet created, but failed to load wallet details.");
+        setStatus("Mint transaction submitted successfully.");
       });
-    });
+    } catch (err) {
+      console.log("Mint error:", err);
+      setStatus("Mint failed: " + (err?.message ?? "Network or server error"));
+      setMintLoading(false);
+    }
   };
 
   const primaryWallet = wallets[0];
@@ -415,41 +538,19 @@ export default function HomePage() {
     <main>
       <div style={{ width: "50%", margin: "0 auto" }}>
         <h1>Create a user wallet with Google social login</h1>
-        <p>Follow the buttons below to complete the flow:</p>
+        <p>Sign in with Google to create or access your wallet. Device token and wallet setup run automatically.</p>
 
-        <div>
-          <button
-            onClick={handleCreateDeviceToken}
-            style={{ margin: "6px" }}
-            disabled={!sdkReady || !deviceId || deviceIdLoading}
-          >
-            1. Create device token
-          </button>
-          <br />
-          <button
-            onClick={handleLoginWithGoogle}
-            style={{ margin: "6px" }}
-            disabled={!deviceToken || !deviceEncryptionKey}
-          >
-            2. Login with Google
-          </button>
-          <br />
-          <button
-            onClick={handleInitializeUser}
-            style={{ margin: "6px" }}
-            disabled={!loginResult || wallets.length > 0}
-          >
-            3. Initialize user (get challenge)
-          </button>
-          <br />
-          <button
-            onClick={handleExecuteChallenge}
-            style={{ margin: "6px" }}
-            disabled={!challengeId || wallets.length > 0}
-          >
-            4. Create wallet (execute challenge)
-          </button>
-        </div>
+        {!primaryWallet && (
+          <div>
+            <button
+              onClick={handleLoginWithGoogle}
+              style={{ margin: "6px", padding: "10px 20px", fontSize: "16px" }}
+              disabled={!sdkReady || !deviceToken || !deviceEncryptionKey || deviceIdLoading}
+            >
+              Login with Google
+            </button>
+          </div>
+        )}
 
         <p>
           <strong>Status:</strong> {status}
@@ -478,6 +579,46 @@ export default function HomePage() {
           </div>
         )}
 
+        {primaryWallet && (
+          <div style={{ marginTop: "24px", padding: "16px", border: "1px solid #ccc", borderRadius: "8px" }}>
+            <h2>Mint tokens</h2>
+            <p style={{ marginBottom: "12px", fontSize: "14px", color: "#555" }}>
+              Call <code>mint(uint256 _amount, address _receiver)</code> on your token contract.
+            </p>
+            <div style={{ marginBottom: "12px" }}>
+              <label style={{ display: "block", marginBottom: "4px", fontWeight: "bold" }}>
+                Receiver address
+              </label>
+              <input
+                type="text"
+                value={mintReceiver}
+                onChange={(e) => setMintReceiver(e.target.value)}
+                placeholder="0x..."
+                style={{ width: "100%", padding: "8px", boxSizing: "border-box" }}
+              />
+            </div>
+            <div style={{ marginBottom: "12px" }}>
+              <label style={{ display: "block", marginBottom: "4px", fontWeight: "bold" }}>
+                Amount
+              </label>
+              <input
+                type="text"
+                value={mintAmount}
+                onChange={(e) => setMintAmount(e.target.value)}
+                placeholder="e.g. 1000"
+                style={{ width: "100%", padding: "8px", boxSizing: "border-box" }}
+              />
+            </div>
+            <button
+              onClick={handleMint}
+              disabled={mintLoading || !contractAddress?.trim() || !mintReceiver?.trim() || !mintAmount?.trim()}
+              style={{ marginTop: "8px", padding: "8px 16px" }}
+            >
+              {mintLoading ? "Minting…" : "Mint"}
+            </button>
+          </div>
+        )}
+
         <pre
           style={{
             whiteSpace: "pre-wrap",
@@ -493,7 +634,6 @@ export default function HomePage() {
               deviceEncryptionKey,
               userToken: loginResult?.userToken,
               encryptionKey: loginResult?.encryptionKey,
-              challengeId,
               wallets,
               usdcBalance,
             },

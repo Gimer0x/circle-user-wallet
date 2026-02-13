@@ -52,11 +52,14 @@ NEXT_PUBLIC_CIRCLE_APP_ID=<YOUR_CIRCLE_APP_ID>
 - **NEXT_PUBLIC_GOOGLE_CLIENT_ID** – Google OAuth Web Client ID from Step 1
 - **NEXT_PUBLIC_CIRCLE_APP_ID** – Circle Wallet App ID from Step 2
 
-Optional (defaults to `https://api.circle.com` if omitted):
+Optional:
 
 ```env
 NEXT_PUBLIC_CIRCLE_BASE_URL=https://api.circle.com
+NEXT_PUBLIC_CONTRACT_ADDRESS=0x...
 ```
+
+- **NEXT_PUBLIC_CONTRACT_ADDRESS** – Token contract address for the mint feature (must expose `mint(uint256,address)`). Omit if you are not using the mint UI.
 
 ## Run the app
 
