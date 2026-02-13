@@ -13,6 +13,8 @@ export default function HomePage() {
   const sdkRef = useRef(null);
   const postLoginFlowRef = useRef(null);
   const refreshDeviceTokenRef = useRef(null);
+  const createTokenInFlightRef = useRef(false);
+  const hasRestoredSessionRef = useRef(false);
 
   const [sdkReady, setSdkReady] = useState(false);
   const [deviceId, setDeviceId] = useState("");
@@ -78,6 +80,10 @@ export default function HomePage() {
             encryptionKey: result.encryptionKey,
           });
           setLoginError(null);
+          if (typeof window !== "undefined") {
+            sessionStorage.setItem("circleUserToken", result.userToken);
+            sessionStorage.setItem("circleEncryptionKey", result.encryptionKey);
+          }
           setStatus("Setting up your wallet...");
           postLoginFlowRef.current?.(result.userToken, result.encryptionKey);
         };
@@ -125,7 +131,7 @@ export default function HomePage() {
     };
   }, []);
 
-  // Get deviceId and ensure device token exists (auto-create or restore from cookies)
+  // Get deviceId and ensure device token exists (reuse from cookies when possible; create only once per load)
   useEffect(() => {
     const ensureDeviceToken = async () => {
       if (!sdkRef.current) return;
@@ -158,13 +164,32 @@ export default function HomePage() {
           return;
         }
 
+        if (createTokenInFlightRef.current) return;
+        createTokenInFlightRef.current = true;
         setStatus("Creating device token...");
+
         const response = await fetch("/api/endpoints", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "createDeviceToken", deviceId: id }),
         });
         const data = await response.json();
+        createTokenInFlightRef.current = false;
+
+        if (response.status === 409) {
+          const tokenAfter = getCookie("deviceToken");
+          const keyAfter = getCookie("deviceEncryptionKey");
+          if (tokenAfter && keyAfter) {
+            setDeviceToken(tokenAfter);
+            setDeviceEncryptionKey(keyAfter);
+            setStatus("Ready. Sign in with Google to continue.");
+            return;
+          }
+          setStatus(
+            "One token per device. Clear site data for this origin and reload to sign in again.",
+          );
+          return;
+        }
 
         if (!response.ok) {
           console.log("Create device token failed:", data);
@@ -178,6 +203,7 @@ export default function HomePage() {
         setCookie("deviceEncryptionKey", data.deviceEncryptionKey);
         setStatus("Ready. Sign in with Google to continue.");
       } catch (error) {
+        createTokenInFlightRef.current = false;
         console.log("Device token setup failed:", error);
         setStatus("Failed to set up device token");
         setDeviceIdLoading(false);
@@ -187,6 +213,34 @@ export default function HomePage() {
     if (sdkReady) {
       void ensureDeviceToken();
     }
+  }, [sdkReady]);
+
+  // Restore session from sessionStorage so user stays connected after reload
+  useEffect(() => {
+    if (!sdkReady || hasRestoredSessionRef.current) return;
+    const userToken =
+      typeof window !== "undefined"
+        ? sessionStorage.getItem("circleUserToken")
+        : null;
+    const encryptionKey =
+      typeof window !== "undefined"
+        ? sessionStorage.getItem("circleEncryptionKey")
+        : null;
+    if (!userToken || !encryptionKey) return;
+
+    hasRestoredSessionRef.current = true;
+    setLoginResult({ userToken, encryptionKey });
+    setStatus("Restoring session...");
+    loadWallets(userToken, { source: "alreadyInitialized" }).catch(() => {
+      if (typeof window !== "undefined") {
+        sessionStorage.removeItem("circleUserToken");
+        sessionStorage.removeItem("circleEncryptionKey");
+      }
+      setLoginResult(null);
+      setWallets([]);
+      setUsdcBalance(null);
+      setStatus("Session expired or invalid. Please sign in again.");
+    });
   }, [sdkReady]);
 
   // Helper to load USDC balance for a wallet
@@ -249,7 +303,7 @@ export default function HomePage() {
       if (!response.ok) {
         console.log("List wallets failed:", data);
         setStatus("Failed to load wallet details");
-        return;
+        throw new Error(data.error || data.message || "List wallets failed");
       }
 
       const wallets = data.wallets || [];
@@ -276,6 +330,7 @@ export default function HomePage() {
     } catch (err) {
       console.log("Failed to load wallet details:", err);
       setStatus("Failed to load wallet details");
+      throw err;
     }
   };
 
@@ -365,6 +420,13 @@ export default function HomePage() {
         body: JSON.stringify({ action: "createDeviceToken", deviceId: id }),
       });
       const data = await response.json();
+
+      if (response.status === 409) {
+        setStatus(
+          "Session conflict. Clear site data for this origin and reload, then try again.",
+        );
+        return;
+      }
 
       if (!response.ok) {
         setStatus("Failed to refresh device token. Please reload the page.");
@@ -532,6 +594,18 @@ export default function HomePage() {
     }
   };
 
+  const handleLogout = () => {
+    if (typeof window !== "undefined") {
+      sessionStorage.removeItem("circleUserToken");
+      sessionStorage.removeItem("circleEncryptionKey");
+    }
+    setLoginResult(null);
+    setLoginError(null);
+    setWallets([]);
+    setUsdcBalance(null);
+    setStatus("You are logged out.");
+  };
+
   const primaryWallet = wallets[0];
 
   return (
@@ -564,7 +638,16 @@ export default function HomePage() {
 
         {primaryWallet && (
           <div style={{ marginTop: "12px" }}>
-            <h2>Wallet details</h2>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+              <h2 style={{ margin: 0 }}>Wallet details</h2>
+              <button
+                type="button"
+                onClick={handleLogout}
+                style={{ padding: "6px 12px", fontSize: "14px" }}
+              >
+                Log out
+              </button>
+            </div>
             <p>
               <strong>Address:</strong> {primaryWallet.address}
             </p>
