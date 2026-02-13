@@ -160,6 +160,22 @@ export default function HomePage() {
         if (existingToken && existingKey) {
           setDeviceToken(existingToken);
           setDeviceEncryptionKey(existingKey);
+          const sdk = sdkRef.current;
+          if (sdk) {
+            sdk.updateConfigs({
+              appSettings: { appId },
+              loginConfigs: {
+                deviceToken: existingToken,
+                deviceEncryptionKey: existingKey,
+                google: {
+                  clientId: googleClientId,
+                  redirectUri:
+                    typeof window !== "undefined" ? window.location.origin : "",
+                  selectAccountPrompt: true,
+                },
+              },
+            });
+          }
           setStatus("Ready. Sign in with Google to continue.");
           return;
         }
@@ -199,8 +215,11 @@ export default function HomePage() {
 
         setDeviceToken(data.deviceToken);
         setDeviceEncryptionKey(data.deviceEncryptionKey);
-        setCookie("deviceToken", data.deviceToken);
-        setCookie("deviceEncryptionKey", data.deviceEncryptionKey);
+        const oneDay = 60 * 60 * 24;
+        setCookie("deviceToken", data.deviceToken, { maxAge: oneDay });
+        setCookie("deviceEncryptionKey", data.deviceEncryptionKey, {
+          maxAge: oneDay,
+        });
         setStatus("Ready. Sign in with Google to continue.");
       } catch (error) {
         createTokenInFlightRef.current = false;
@@ -435,8 +454,11 @@ export default function HomePage() {
 
       setDeviceToken(data.deviceToken);
       setDeviceEncryptionKey(data.deviceEncryptionKey);
-      setCookie("deviceToken", data.deviceToken);
-      setCookie("deviceEncryptionKey", data.deviceEncryptionKey);
+      const oneDay = 60 * 60 * 24;
+      setCookie("deviceToken", data.deviceToken, { maxAge: oneDay });
+      setCookie("deviceEncryptionKey", data.deviceEncryptionKey, {
+        maxAge: oneDay,
+      });
 
       const sdk = sdkRef.current;
       if (sdk) {
@@ -476,10 +498,11 @@ export default function HomePage() {
     }
 
     // Persist configs so SDK can rehydrate after redirect
-    setCookie("appId", appId);
-    setCookie("google.clientId", googleClientId);
-    setCookie("deviceToken", deviceToken);
-    setCookie("deviceEncryptionKey", deviceEncryptionKey);
+    const oneDay = 60 * 60 * 24;
+    setCookie("appId", appId, { maxAge: oneDay });
+    setCookie("google.clientId", googleClientId, { maxAge: oneDay });
+    setCookie("deviceToken", deviceToken, { maxAge: oneDay });
+    setCookie("deviceEncryptionKey", deviceEncryptionKey, { maxAge: oneDay });
 
     sdk.updateConfigs({
       appSettings: {
